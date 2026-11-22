@@ -345,6 +345,34 @@ impl Event {
         .await
     }
 
+    /// Whether the same member recently produced this exact cipher access event.
+    ///
+    /// Clients also report viewed/copied/toggled events after a server-side read. A short
+    /// window keeps those reports from duplicating the authoritative server-side audit entry.
+    pub async fn has_recent_cipher_access(
+        cipher_uuid: &CipherId,
+        org_uuid: &OrganizationId,
+        act_user_uuid: &UserId,
+        event_type: i32,
+        since: &NaiveDateTime,
+        conn: &DbConn,
+    ) -> bool {
+        conn.run(move |conn| {
+            event::table
+                .filter(event::cipher_uuid.eq(cipher_uuid))
+                .filter(event::org_uuid.eq(org_uuid))
+                .filter(event::act_user_uuid.eq(act_user_uuid))
+                .filter(event::event_type.eq(event_type))
+                .filter(event::event_date.ge(since))
+                .count()
+                .first::<i64>(conn)
+                .ok()
+                .unwrap_or(0)
+                > 0
+        })
+        .await
+    }
+
     pub async fn clean_events(conn: &DbConn) -> EmptyResult {
         let Some(days_to_retain) = CONFIG.events_days_retain().filter(|&d| d != 0) else {
             return Ok(());

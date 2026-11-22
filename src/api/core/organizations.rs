@@ -23,10 +23,11 @@ use crate::{
             Cipher, CipherAccessScope, CipherId, Collection, CollectionCipher, CollectionGroup, CollectionId,
             CollectionUser, CustomPermission, Device, EventType, FillAssistPolicyData, Group, GroupId, GroupUser,
             Invitation, KeyId, Membership, MembershipId, MembershipStatus, MembershipType, OrgPolicy, OrgPolicyType,
-            Organization, OrganizationApiKey, OrganizationId, TwoFactor, TwoFactorType, User, UserId,
-            custom_roles_enabled,
+            Organization, OrganizationApiKey, OrganizationId, RestrictItemSharingPolicyData, TwoFactor, TwoFactorType,
+            User, UserId, custom_roles_enabled,
         },
     },
+    error::MapResult,
     mail,
     sso::FAKE_SSO_IDENTIFIER,
     util::{NumberOrString, convert_json_key_lcase_first},
@@ -2124,6 +2125,7 @@ async fn post_org_import(
             cipher_data.folder_id = None;
             // The authenticated membership, rather than the imported file, selects the organization.
             cipher_data.organization_id = Some(org_id.clone());
+            OrgPolicy::enforce_item_sharing_policy(&membership, &collection_ids, &conn).await?;
             let mut cipher = Cipher::new(cipher_data.r#type);
             update_cipher_from_data(
                 &mut cipher,
@@ -2301,6 +2303,11 @@ async fn post_bulk_collections(data: Json<BulkCollectionsData>, headers: Headers
                     CollectionCipher::delete(&cipher.uuid, collection, &conn).await?;
                 }
             } else {
+                let current: HashSet<CollectionId> =
+                    CollectionCipher::find_by_cipher(&cipher.uuid, &conn).await.into_iter().collect();
+                let additions: Vec<CollectionId> =
+                    data.collection_ids.iter().filter(|id| !current.contains(*id)).cloned().collect();
+                OrgPolicy::enforce_item_sharing_policy(&member, &additions, &conn).await?;
                 for collection in &data.collection_ids {
                     CollectionCipher::save(&cipher.uuid, collection, &conn).await?;
                 }
@@ -2420,11 +2427,27 @@ async fn put_policy(
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
-    let data: PolicyData = data.into_inner().policy;
+    let mut data: PolicyData = data.into_inner().policy;
 
     let Some(pol_type_enum) = OrgPolicyType::from_i32(pol_type) else {
         err!("Invalid or unsupported policy type")
     };
+
+    if pol_type_enum == OrgPolicyType::RestrictItemSharing {
+        let mut sharing = RestrictItemSharingPolicyData::from_value(data.data.as_ref())
+            .map_res("Invalid data for the item sharing restriction policy")?;
+        let mut seen = HashSet::new();
+        for collection_id in &sharing.allowed_collection_ids {
+            if !seen.insert(collection_id) {
+                err!("The item sharing restriction policy contains a duplicate collection")
+            }
+            if Collection::find_by_uuid_and_org(collection_id, &org_id, &conn).await.is_none() {
+                err!("The item sharing restriction policy contains a collection outside this organization")
+            }
+        }
+        sharing.allowed_collection_ids.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+        data.data = Some(sharing.to_value());
+    }
 
     let current_policy = OrgPolicy::find_by_org_and_type(&org_id, pol_type_enum, &conn).await;
     let is_currently_enabled = current_policy.as_ref().is_some_and(|policy| policy.enabled);
@@ -3899,6 +3922,20 @@ mod tests {
     }
 
     #[cfg(sqlite)]
+    async fn policies_headers(member: &Membership, conn: &DbConn) -> ManagePoliciesHeaders {
+        let headers = users_headers(member, conn).await;
+        ManagePoliciesHeaders {
+            host: headers.host,
+            device: headers.device,
+            user: headers.user,
+            membership: headers.membership,
+            membership_type: headers.membership_type,
+            ip: headers.ip,
+            org_id: headers.org_id,
+        }
+    }
+
+    #[cfg(sqlite)]
     #[test]
     fn manage_users_can_reinvite_and_confirm_higher_role_members() {
         use crate::api::notifications::{WS_USERS, WebSocketUsers};
@@ -4108,6 +4145,74 @@ mod tests {
                 json!([members[3].to_json_details_for_admin(false, false, &conn).await])
             );
             assert!(get_groups(org.uuid.clone(), directory_headers(&members[4], &conn).await, db.conn()).await.is_ok());
+        });
+    }
+
+    #[cfg(sqlite)]
+    #[test]
+    fn item_sharing_policy_uses_the_existing_policy_api() {
+        test_db::run(async |db| {
+            let conn = db.conn();
+            let org = test_db::organization(&conn).await;
+            let (_, owner) = test_db::member(&conn, &org.uuid, MembershipType::Owner, &[]).await;
+            let allowed = test_db::collection(&conn, &org.uuid).await;
+            let foreign = test_db::organization(&conn).await;
+            let foreign_collection = test_db::collection(&conn, &foreign.uuid).await;
+
+            let policy = put_policy(
+                org.uuid.clone(),
+                OrgPolicyType::RestrictItemSharing as i32,
+                Json(PutPolicy {
+                    policy: PolicyData {
+                        enabled: true,
+                        data: Some(json!({"allowedCollectionIds": [allowed.uuid.clone()]})),
+                    },
+                }),
+                policies_headers(&owner, &conn).await,
+                db.conn(),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            assert_eq!(policy["object"], "policy");
+            assert_eq!(policy["type"], OrgPolicyType::RestrictItemSharing as i32);
+            assert_eq!(policy["enabled"], true);
+            assert_eq!(policy["data"]["allowedCollectionIds"], json!([allowed.uuid]));
+
+            let fetched = get_policy(
+                org.uuid.clone(),
+                OrgPolicyType::RestrictItemSharing as i32,
+                policies_headers(&owner, &conn).await,
+                db.conn(),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            assert_eq!(fetched, policy);
+
+            let rejected = put_policy(
+                org.uuid.clone(),
+                OrgPolicyType::RestrictItemSharing as i32,
+                Json(PutPolicy {
+                    policy: PolicyData {
+                        enabled: true,
+                        data: Some(json!({"allowedCollectionIds": [foreign_collection.uuid]})),
+                    },
+                }),
+                policies_headers(&owner, &conn).await,
+                db.conn(),
+            )
+            .await;
+            assert!(rejected.is_err());
+
+            let unchanged =
+                OrgPolicy::find_by_org_and_type(&org.uuid, OrgPolicyType::RestrictItemSharing, &conn).await.unwrap();
+            assert_eq!(
+                RestrictItemSharingPolicyData::from_value(Some(&serde_json::from_str(&unchanged.data).unwrap()))
+                    .unwrap()
+                    .allowed_collection_ids,
+                vec![allowed.uuid]
+            );
         });
     }
 }

@@ -911,6 +911,17 @@ impl CollectionUser {
 
 /// Database methods
 impl CollectionCipher {
+    pub async fn find_by_cipher(cipher_uuid: &CipherId, conn: &DbConn) -> Vec<CollectionId> {
+        conn.run(move |conn| {
+            ciphers_collections::table
+                .filter(ciphers_collections::cipher_uuid.eq(cipher_uuid))
+                .select(ciphers_collections::collection_uuid)
+                .load::<CollectionId>(conn)
+                .expect("Error loading cipher collections")
+        })
+        .await
+    }
+
     pub async fn save(cipher_uuid: &CipherId, collection_uuid: &CollectionId, conn: &DbConn) -> EmptyResult {
         Self::update_users_revision(collection_uuid, conn).await;
 

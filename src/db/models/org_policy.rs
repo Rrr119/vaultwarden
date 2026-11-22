@@ -1,7 +1,9 @@
+use std::collections::HashSet;
+
 use chrono::{NaiveDateTime, Utc};
 use derive_more::{AsRef, From};
 use diesel::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
@@ -15,7 +17,9 @@ use crate::{
     util::format_date,
 };
 
-use super::{Membership, MembershipId, MembershipStatus, MembershipType, OrganizationId, TwoFactor, UserId};
+use super::{
+    CollectionId, Membership, MembershipId, MembershipStatus, MembershipType, OrganizationId, TwoFactor, UserId,
+};
 
 #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
 #[diesel(table_name = org_policies)]
@@ -55,6 +59,8 @@ pub enum OrgPolicyType {
     OrganizationUserNotification = 20,
     // SendControls = 21, // Not supported yet
     FillAssist = 22,
+    // Upstream AutotypeGaPolicy = 23, so this Vaultwarden extension starts at 24.
+    RestrictItemSharing = 24,
 }
 
 // https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Core/AdminConsole/Models/Data/Organizations/Policies/SendOptionsPolicyData.cs#L5
@@ -79,6 +85,32 @@ pub struct ResetPasswordDataModel {
 pub struct FillAssistPolicyData {
     #[serde(alias = "RulesUrl")]
     pub rules_url: Option<String>,
+}
+
+/// Vaultwarden extension: when enabled, members other than owners and admins may only add
+/// organization items to the collections listed here. An empty list blocks all new shares.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestrictItemSharingPolicyData {
+    #[serde(alias = "AllowedCollectionIds")]
+    pub allowed_collection_ids: Vec<CollectionId>,
+}
+
+impl RestrictItemSharingPolicyData {
+    pub fn from_value(value: Option<&Value>) -> Result<Self, serde_json::Error> {
+        match value {
+            None | Some(Value::Null) => Ok(Self {
+                allowed_collection_ids: Vec::new(),
+            }),
+            Some(value) => serde_json::from_value(value.clone()),
+        }
+    }
+
+    pub fn to_value(&self) -> Value {
+        json!({
+            "allowedCollectionIds": self.allowed_collection_ids,
+        })
+    }
 }
 
 /// Local methods
@@ -409,6 +441,45 @@ impl OrgPolicy {
             return policy.enabled;
         }
         false
+    }
+
+    /// Enforces the optional item sharing restriction for `member`.
+    ///
+    /// Only newly added collection links should be passed here. Removing a link is always
+    /// allowed, otherwise a policy change could strand an item in a collection. Owners and
+    /// admins are exempt, matching the other member-facing organization policies.
+    pub async fn enforce_item_sharing_policy(
+        member: &Membership,
+        collection_ids: &[CollectionId],
+        conn: &DbConn,
+    ) -> EmptyResult {
+        if collection_ids.is_empty() || member.atype >= MembershipType::Admin {
+            return Ok(());
+        }
+
+        let Some(policy) = Self::find_by_org_and_type(&member.org_uuid, OrgPolicyType::RestrictItemSharing, conn)
+            .await
+            .filter(|policy| policy.enabled)
+        else {
+            return Ok(());
+        };
+
+        let allowed: HashSet<CollectionId> = match serde_json::from_str::<RestrictItemSharingPolicyData>(&policy.data) {
+            Ok(data) => data.allowed_collection_ids.into_iter().collect(),
+            Err(err) => {
+                error!("Failed to deserialize RestrictItemSharingPolicyData: {err}");
+                HashSet::new()
+            }
+        };
+
+        if let Some(denied) = collection_ids.iter().find(|id| !allowed.contains(*id)) {
+            err!(format!(
+                "Sharing to collection {} is restricted by the organization's item sharing policy",
+                denied.as_ref()
+            ));
+        }
+
+        Ok(())
     }
 }
 

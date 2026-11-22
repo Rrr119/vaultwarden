@@ -12,7 +12,10 @@ use serde_json::Value;
 
 use crate::{
     CONFIG,
-    api::{self, ApiResult, EmptyResult, JsonResult, Notify, PasswordOrOtpData, UpdateType, core::log_event},
+    api::{
+        self, ApiResult, EmptyResult, JsonResult, Notify, PasswordOrOtpData, UpdateType,
+        core::{log_cipher_access, log_event},
+    },
     auth::ClientVersion,
     auth::{Headers, OrgIdGuard, OwnerHeaders},
     config::PathType,
@@ -265,6 +268,16 @@ async fn get_cipher_impl(
     if !cipher.is_accessible_to_user(&headers.user.uuid, scope, conn).await {
         err!("Cipher is not owned by user")
     }
+
+    log_cipher_access(
+        EventType::CipherClientViewed,
+        &cipher,
+        &headers.user.uuid,
+        headers.device.atype,
+        &headers.ip.ip,
+        conn,
+    )
+    .await;
 
     Ok(Json(cipher_json_for_scope(&cipher, headers, scope, conn).await?))
 }
@@ -1195,6 +1208,10 @@ async fn update_collections_by_scope(
             let Some(org_uuid) = cipher.organization_uuid.clone() else {
                 err!("Cipher is not owned by an organization")
             };
+            let Some(member) = Membership::find_confirmed_by_user_and_org(&headers.user.uuid, &org_uuid, &conn).await
+            else {
+                err!("Cipher is not write accessible")
+            };
             let posted = HashSet::<CollectionId>::from_iter(data.collection_ids);
             let current = HashSet::<CollectionId>::from_iter(match scope {
                 CipherAccessScope::User => cipher.get_collections(headers.user.uuid.clone(), &conn).await,
@@ -1204,10 +1221,7 @@ async fn update_collections_by_scope(
             });
             // The admin route accepts Edit Any for all collections of this cipher's organization.
             // The personal route keeps the direct/group write check, even for that same member.
-            let admin_edit_any = scope == CipherAccessScope::OrganizationAdmin
-                && Membership::find_confirmed_by_user_and_org(&headers.user.uuid, &org_uuid, &conn)
-                    .await
-                    .is_some_and(|member| member.can_edit_any_collection());
+            let admin_edit_any = scope == CipherAccessScope::OrganizationAdmin && member.can_edit_any_collection();
             for id in &posted {
                 if Collection::find_by_uuid_and_org(id, &org_uuid, &conn).await.is_none() {
                     err!("Invalid collection ID provided")
@@ -1223,6 +1237,9 @@ async fn update_collections_by_scope(
                 }
                 changes.push((collection.uuid, posted.contains(id)));
             }
+            let additions: Vec<CollectionId> =
+                changes.iter().filter(|(_, add)| *add).map(|(id, _)| id.clone()).collect();
+            OrgPolicy::enforce_item_sharing_policy(&member, &additions, &conn).await?;
             // Every ID and permission has been checked. A database error rolls back links and revisions.
             for (id, add) in changes {
                 if add {
@@ -1483,14 +1500,22 @@ async fn share_cipher_by_uuid(
             let transfer_cipher = cipher.organization_uuid.is_none() && data.cipher.organization_id.is_some();
             let mut shared_to_collections = Vec::new();
             if let Some(organization_id) = &data.cipher.organization_id {
-                let admin_edit_any = response_scope == CipherAccessScope::OrganizationAdmin
-                    && Membership::find_confirmed_by_user_and_org(&headers.user.uuid, organization_id, conn)
-                        .await
-                        .is_some_and(|member| member.can_edit_any_collection());
+                let Some(member) =
+                    Membership::find_confirmed_by_user_and_org(&headers.user.uuid, organization_id, conn).await
+                else {
+                    err!("You don't have permission to add item to organization")
+                };
+                let admin_edit_any =
+                    response_scope == CipherAccessScope::OrganizationAdmin && member.can_edit_any_collection();
                 if response_scope == CipherAccessScope::OrganizationAdmin && !admin_edit_any {
                     err!("Cipher is not write accessible")
                 }
-                for col_id in HashSet::<CollectionId>::from_iter(data.collection_ids) {
+                let requested = HashSet::<CollectionId>::from_iter(data.collection_ids);
+                let current: HashSet<CollectionId> =
+                    CollectionCipher::find_by_cipher(&cipher.uuid, conn).await.into_iter().collect();
+                let additions: Vec<CollectionId> =
+                    requested.iter().filter(|id| !current.contains(*id)).cloned().collect();
+                for col_id in requested {
                     let Some(collection) = Collection::find_by_uuid_and_org(&col_id, organization_id, conn).await
                     else {
                         err!("Invalid collection ID provided")
@@ -1500,6 +1525,7 @@ async fn share_cipher_by_uuid(
                     }
                     shared_to_collections.push(collection.uuid);
                 }
+                OrgPolicy::enforce_item_sharing_policy(&member, &additions, conn).await?;
             }
             if is_new {
                 cipher.save(conn).await?;
@@ -2837,11 +2863,17 @@ impl CipherSyncData {
 mod custom_role_tests {
     use super::*;
     use crate::{
-        api::notifications::{WS_USERS, WebSocketUsers},
+        api::{
+            core::event_test_flag,
+            notifications::{WS_USERS, WebSocketUsers},
+        },
         auth::ClientIp,
-        db::{models::Device, test_db},
+        db::{
+            models::{Device, Event, RestrictItemSharingPolicyData},
+            test_db,
+        },
     };
-    use chrono::Datelike;
+    use chrono::{Datelike, TimeDelta};
     use diesel::connection::SimpleConnection;
     use std::sync::Arc;
 
@@ -2970,6 +3002,156 @@ mod custom_role_tests {
                     }
                 }
             }
+        });
+    }
+
+    fn cipher_headers(user: User) -> Headers {
+        Headers {
+            host: "http://localhost".into(),
+            device: Device::new("test".to_owned().into(), user.uuid.clone(), "test".into(), 1),
+            user,
+            ip: ClientIp {
+                ip: "127.0.0.1".parse().unwrap(),
+            },
+        }
+    }
+
+    fn share_request(
+        cipher: &Cipher,
+        owner: &UserId,
+        org: &OrganizationId,
+        collections: Vec<CollectionId>,
+    ) -> ShareCipherData {
+        serde_json::from_value(json!({
+            "cipher": {
+                "id": cipher.uuid,
+                "name": "Shared",
+                "type": 2,
+                "organizationId": org,
+                "encryptedFor": owner,
+                "secureNote": {"type": 0}
+            },
+            "collectionIds": collections,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn server_side_reads_audit_org_ciphers_and_ignore_personal_items() {
+        test_db::run(async |db| {
+            event_test_flag::ORG_EVENTS_ENABLED.set(Some(true));
+            let conn = db.conn();
+            let org = test_db::organization(&conn).await;
+            let (user, _) = test_db::member(&conn, &org.uuid, MembershipType::User, &[]).await;
+            let collection = test_db::collection(&conn, &org.uuid).await;
+            CollectionUser::save(&user.uuid, &collection.uuid, false, false, false, &conn).await.unwrap();
+
+            let mut cipher = Cipher::new(2);
+            cipher.name = "Organization item".into();
+            cipher.organization_uuid = Some(org.uuid.clone());
+            cipher.save(&conn).await.unwrap();
+            CollectionCipher::save(&cipher.uuid, &collection.uuid, &conn).await.unwrap();
+
+            let headers = cipher_headers(User::find_by_uuid(&user.uuid, &conn).await.unwrap());
+            get_cipher_impl(cipher.uuid.clone(), &headers, CipherAccessScope::User, &conn).await.unwrap();
+
+            let start = (Utc::now() - TimeDelta::minutes(1)).naive_utc();
+            let end = (Utc::now() + TimeDelta::minutes(1)).naive_utc();
+            let events = Event::find_by_organization_uuid(&org.uuid, &start, &end, &conn).await;
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event_type, EventType::CipherClientViewed as i32);
+            assert_eq!(events[0].cipher_uuid.as_ref(), Some(&cipher.uuid));
+            assert_eq!(events[0].act_user_uuid.as_ref(), Some(&user.uuid));
+
+            let mut personal = Cipher::new(2);
+            personal.name = "Personal item".into();
+            personal.user_uuid = Some(user.uuid.clone());
+            personal.save(&conn).await.unwrap();
+            get_cipher_impl(personal.uuid, &headers, CipherAccessScope::User, &conn).await.unwrap();
+            assert_eq!(Event::find_by_organization_uuid(&org.uuid, &start, &end, &conn).await.len(), 1);
+            event_test_flag::ORG_EVENTS_ENABLED.set(None);
+        });
+    }
+
+    #[test]
+    fn item_sharing_policy_restricts_new_links_and_exempts_admins() {
+        test_db::run(async |db| {
+            let conn = db.conn();
+            let org = test_db::organization(&conn).await;
+            let (user, _) = test_db::member(&conn, &org.uuid, MembershipType::User, &[]).await;
+            let (admin, _) = test_db::member(&conn, &org.uuid, MembershipType::Admin, &[]).await;
+            let allowed = test_db::collection(&conn, &org.uuid).await;
+            let blocked = test_db::collection(&conn, &org.uuid).await;
+            for collection in [&allowed, &blocked] {
+                CollectionUser::save(&user.uuid, &collection.uuid, false, false, false, &conn).await.unwrap();
+            }
+            let mut policy = OrgPolicy::new(
+                org.uuid.clone(),
+                OrgPolicyType::RestrictItemSharing,
+                true,
+                RestrictItemSharingPolicyData {
+                    allowed_collection_ids: vec![allowed.uuid.clone()],
+                }
+                .to_value()
+                .to_string(),
+            );
+            policy.save(&conn).await.unwrap();
+
+            let rocket = rocket::build().manage(Arc::clone(&WS_USERS));
+            let notify = rocket.state::<Arc<WebSocketUsers>>().unwrap();
+            let notify: Notify<'_> = notify.into();
+            let mut cipher = Cipher::new(2);
+            cipher.name = "Personal item".into();
+            cipher.user_uuid = Some(user.uuid.clone());
+            cipher.save(&conn).await.unwrap();
+            let user_headers = cipher_headers(User::find_by_uuid(&user.uuid, &conn).await.unwrap());
+
+            let denied = share_cipher_by_uuid(
+                &cipher.uuid,
+                None,
+                share_request(&cipher, &user.uuid, &org.uuid, vec![blocked.uuid.clone()]),
+                &user_headers,
+                CipherAccessScope::User,
+                &conn,
+                &notify,
+                None,
+            )
+            .await;
+            assert!(denied.is_err());
+            assert_eq!(Cipher::find_by_uuid(&cipher.uuid, &conn).await.unwrap().organization_uuid, None);
+
+            let shared = share_cipher_by_uuid(
+                &cipher.uuid,
+                None,
+                share_request(&cipher, &user.uuid, &org.uuid, vec![allowed.uuid.clone()]),
+                &user_headers,
+                CipherAccessScope::User,
+                &conn,
+                &notify,
+                None,
+            )
+            .await;
+            assert!(shared.is_ok());
+            assert_eq!(CollectionCipher::find_by_cipher(&cipher.uuid, &conn).await, vec![allowed.uuid.clone()]);
+
+            let mut admin_cipher = Cipher::new(2);
+            admin_cipher.name = "Admin item".into();
+            admin_cipher.user_uuid = Some(admin.uuid.clone());
+            admin_cipher.save(&conn).await.unwrap();
+            let admin_headers = cipher_headers(User::find_by_uuid(&admin.uuid, &conn).await.unwrap());
+            let admin_shared = share_cipher_by_uuid(
+                &admin_cipher.uuid,
+                None,
+                share_request(&admin_cipher, &admin.uuid, &org.uuid, vec![blocked.uuid.clone()]),
+                &admin_headers,
+                CipherAccessScope::User,
+                &conn,
+                &notify,
+                None,
+            )
+            .await;
+            assert!(admin_shared.is_ok());
+            assert_eq!(CollectionCipher::find_by_cipher(&admin_cipher.uuid, &conn).await, vec![blocked.uuid]);
         });
     }
 }

@@ -1,6 +1,6 @@
 use std::net::IpAddr;
 
-use chrono::NaiveDateTime;
+use chrono::{NaiveDateTime, TimeDelta, Utc};
 use rocket::{Route, form::FromForm, serde::json::Json};
 use serde_json::Value;
 
@@ -23,6 +23,22 @@ use crate::{
 /// /api routes
 pub fn routes() -> Vec<Route> {
     routes![get_org_events, get_cipher_events, get_user_events,]
+}
+
+#[cfg(test)]
+pub mod test_flag {
+    thread_local! {
+        /// Overrides ORG_EVENTS_ENABLED for tests running on this thread.
+        pub static ORG_EVENTS_ENABLED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+}
+
+pub fn event_logging_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = test_flag::ORG_EVENTS_ENABLED.get() {
+        return enabled;
+    }
+    CONFIG.org_events_enabled()
 }
 
 #[derive(FromForm)]
@@ -55,7 +71,7 @@ async fn get_org_events(
 
     // Return an empty vec when we org events are disabled.
     // This prevents client errors
-    let events_json: Vec<Value> = if CONFIG.org_events_enabled() {
+    let events_json: Vec<Value> = if event_logging_enabled() {
         let (start_date, end_date) = data.date_range()?;
 
         Event::find_by_organization_uuid(&org_id, &start_date, &end_date, &conn)
@@ -80,7 +96,7 @@ async fn get_cipher_events(cipher_id: CipherId, data: EventRange, headers: Heade
     // This prevents client errors
     // Only an Owner or Admin of the organization of the cipher, or a Custom member there with Access event logs, gets
     // its events, and only the ones of that organization
-    let events_json: Vec<Value> = if CONFIG.org_events_enabled()
+    let events_json: Vec<Value> = if event_logging_enabled()
         && let Some(cipher) = Cipher::find_by_uuid(&cipher_id, &conn).await
         && let Some(org_id) = cipher.organization_uuid
         && let Some(member) = Membership::find_confirmed_by_user_and_org(&headers.user.uuid, &org_id, &conn).await
@@ -117,7 +133,7 @@ async fn get_user_events(
     }
     // Return an empty vec when we org events are disabled.
     // This prevents client errors
-    let events_json: Vec<Value> = if CONFIG.org_events_enabled() {
+    let events_json: Vec<Value> = if event_logging_enabled() {
         let (start_date, end_date) = data.date_range()?;
 
         Event::find_by_org_and_member(&org_id, &member_id, &start_date, &end_date, &conn)
@@ -172,7 +188,7 @@ struct EventCollection {
 // https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Core/AdminConsole/Services/Implementations/EventService.cs
 #[post("/collect", format = "application/json", data = "<data>")]
 async fn post_events_collect(data: Json<Vec<EventCollection>>, headers: Headers, conn: DbConn) -> EmptyResult {
-    if !CONFIG.org_events_enabled() {
+    if !event_logging_enabled() {
         return Ok(());
     }
 
@@ -230,18 +246,16 @@ async fn post_events_collect(data: Json<Vec<EventCollection>>, headers: Headers,
                 }
             }
             // Client-side cipher events (viewed, copied, toggled, autofilled, HTTP auth).
-            1107..=1114 | 1117 | 1119..=1133 => {
+            t @ (1107..=1114 | 1117 | 1119..=1133) => {
                 // The cipher determines the organization the event is logged to, so make sure the
                 // user can actually access it instead of trusting the provided cipher uuid.
                 if let Some(cipher_uuid) = &event.cipher_id
                     && let Some(cipher) = Cipher::find_by_uuid(cipher_uuid, &conn).await
                     && cipher.is_accessible_to_user(&headers.user.uuid, CipherAccessScope::User, &conn).await
-                    && let Some(org_id) = cipher.organization_uuid
                 {
-                    log_event_impl(
-                        event.r#type,
-                        cipher_uuid,
-                        &org_id,
+                    log_cipher_access_impl(
+                        t,
+                        &cipher,
                         &headers.user.uuid,
                         headers.device.atype,
                         Some(event_date),
@@ -258,7 +272,7 @@ async fn post_events_collect(data: Json<Vec<EventCollection>>, headers: Headers,
 }
 
 pub async fn log_user_event(event_type: EventType, user_id: &UserId, device_type: i32, ip: &IpAddr, conn: &DbConn) {
-    if !CONFIG.org_events_enabled() {
+    if !event_logging_enabled() {
         return;
     }
     log_user_event_impl(event_type as i32, user_id, device_type, None, ip, conn).await;
@@ -307,10 +321,56 @@ pub async fn log_event(
     ip: &IpAddr,
     conn: &DbConn,
 ) {
-    if !CONFIG.org_events_enabled() {
+    if !event_logging_enabled() {
         return;
     }
     log_event_impl(event_type as i32, source_uuid, org_id, act_user_id, device_type, None, ip, conn).await;
+}
+
+/// Logs an organization cipher access discovered on the server.
+///
+/// This is deliberately independent of a client's `/events/collect` report, so a client cannot
+/// hide a read by omitting the event. The duplicate window absorbs the matching client report.
+pub async fn log_cipher_access(
+    event_type: EventType,
+    cipher: &Cipher,
+    act_user_id: &UserId,
+    device_type: i32,
+    ip: &IpAddr,
+    conn: &DbConn,
+) {
+    if !event_logging_enabled() {
+        return;
+    }
+    log_cipher_access_impl(event_type as i32, cipher, act_user_id, device_type, None, ip, conn).await;
+}
+
+#[expect(clippy::too_many_arguments)]
+async fn log_cipher_access_impl(
+    event_type: i32,
+    cipher: &Cipher,
+    act_user_id: &UserId,
+    device_type: i32,
+    event_date: Option<NaiveDateTime>,
+    ip: &IpAddr,
+    conn: &DbConn,
+) {
+    let Some(org_id) = &cipher.organization_uuid else {
+        return;
+    };
+    if Membership::find_confirmed_by_user_and_org(act_user_id, org_id, conn).await.is_none() {
+        return;
+    }
+
+    let event_date = event_date.unwrap_or_else(|| Utc::now().naive_utc());
+    let Some(since) = event_date.checked_sub_signed(TimeDelta::try_seconds(5).expect("5 seconds is valid")) else {
+        return;
+    };
+    if Event::has_recent_cipher_access(&cipher.uuid, org_id, act_user_id, event_type, &since, conn).await {
+        return;
+    }
+
+    log_event_impl(event_type, &cipher.uuid, org_id, act_user_id, device_type, Some(event_date), ip, conn).await;
 }
 
 #[expect(clippy::too_many_arguments)]
